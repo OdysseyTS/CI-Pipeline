@@ -1,0 +1,73 @@
+# AI PR review with PR-Agent (open-source Qodo Merge) via an OpenAI-compatible LLM endpoint (e.g. LiteLLM).
+# Caller: uses: org/CI-Pipeline/.github/workflows/reusable-pr-agent.yml@main
+#
+# Caller must trigger on `pull_request` (auto describe/review/improve) and optionally
+# `issue_comment` (/review, /describe, /improve, /ask — runs from the caller's default branch),
+# grant `pull-requests: write` + `issues: write`, and pass the LITELLM_API_KEY secret
+# (`secrets: inherit` works).
+
+on:
+  workflow_call:
+    inputs:
+      api-base:
+        description: OpenAI-compatible API base URL (e.g. https://litellm.example.com/v1)
+        type: string
+        required: true
+      model:
+        description: Model name as exposed by the API base
+        type: string
+        default: "gpt-5-mini"
+      max-model-tokens:
+        description: Max input tokens per LLM call (also lifts PR-Agent's 32k default cap)
+        type: number
+        default: 128000
+      max-review-chunks:
+        description: Max LLM calls /review may split a large diff into
+        type: number
+        default: 5
+      auto-describe:
+        description: Auto-generate PR title/description on new PRs
+        type: boolean
+        default: true
+      auto-review:
+        description: Auto-post a review on new PRs
+        type: boolean
+        default: true
+      auto-improve:
+        description: Auto-post code suggestions on new PRs
+        type: boolean
+        default: true
+    secrets:
+      LITELLM_API_KEY:
+        description: API key for the LLM endpoint
+        required: true
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  pr-agent:
+    # Skip bot-triggered events and comments on plain issues (non-PRs)
+    if: >-
+      github.event.sender.type != 'Bot' &&
+      (github.event_name == 'pull_request' || github.event.issue.pull_request)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run PR Agent
+        uses: qodo-ai/pr-agent@981344be2755e303df501e18e3f60b848a188a80 # v0.48.0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          OPENAI_KEY: ${{ secrets.LITELLM_API_KEY }}
+          OPENAI.API_BASE: ${{ inputs.api-base }}
+          CONFIG.MODEL: ${{ inputs.model }}
+          CONFIG.FALLBACK_MODELS: '["${{ inputs.model }}"]'
+          CONFIG.CUSTOM_MODEL_MAX_TOKENS: ${{ inputs.max-model-tokens }}
+          CONFIG.MAX_MODEL_TOKENS: ${{ inputs.max-model-tokens }}
+          # Large PRs: review the whole diff in chunks instead of dropping files that don't fit
+          PR_REVIEWER.ENABLE_LARGE_PR_CHUNKING: "true"
+          PR_REVIEWER.MAX_NUMBER_OF_CALLS: ${{ inputs.max-review-chunks }}
+          GITHUB_ACTION_CONFIG.AUTO_DESCRIBE: ${{ inputs.auto-describe }}
+          GITHUB_ACTION_CONFIG.AUTO_REVIEW: ${{ inputs.auto-review }}
+          GITHUB_ACTION_CONFIG.AUTO_IMPROVE: ${{ inputs.auto-improve }}
