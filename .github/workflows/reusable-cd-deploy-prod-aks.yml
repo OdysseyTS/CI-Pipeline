@@ -1,7 +1,7 @@
 # Reusable CD for PRODUCTION on AKS: build image, push to the prod ACR, helm upgrade.
 #
 # Separate from reusable-cd-deploy.yml on purpose, so the QA path cannot be affected.
-# The single job runs in the GitHub environment "production". Configure that environment
+# The single job runs in the GitHub environment "nutri-prod". Configure that environment
 # in each caller repo with required reviewers (the approval gate) and with these
 # environment secrets, which then apply only to prod deploys:
 #   AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
@@ -67,7 +67,7 @@ jobs:
   deploy-prod-aks:
     name: Build, push and helm deploy (prod)
     runs-on: ubuntu-latest
-    environment: production
+    environment: nutri-prod
     # One prod deploy per service at a time; never cancel one that is mid-rollout.
     concurrency:
       group: prod-deploy-${{ inputs.image-name }}
