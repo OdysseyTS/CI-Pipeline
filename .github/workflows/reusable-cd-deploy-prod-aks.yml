@@ -1,0 +1,164 @@
+# Reusable CD for PRODUCTION on AKS: build image, push to the prod ACR, helm upgrade.
+#
+# Separate from reusable-cd-deploy.yml on purpose, so the QA path cannot be affected.
+# The single job runs in the GitHub environment "production". Configure that environment
+# in each caller repo with required reviewers (the approval gate) and with these
+# environment secrets, which then apply only to prod deploys:
+#   AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
+# Callers must pass `secrets: inherit`.
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: Image name (e.g. nutrition-backend)
+        type: string
+        required: true
+      helm-chart-path:
+        description: Path to the Helm chart directory (relative to repo root)
+        type: string
+        required: true
+      helm-release-name:
+        description: Helm release name (defaults to image-name if not set)
+        type: string
+        default: ""
+      context:
+        description: Docker build context path (relative to repo root)
+        type: string
+        default: "."
+      dockerfile:
+        description: Path to Dockerfile (relative to repo root)
+        type: string
+        default: "Dockerfile"
+      build-args:
+        description: Multiline KEY=value build args (optional)
+        type: string
+        default: ""
+      namespace:
+        type: string
+        default: "nutri-prod"
+      acr-name:
+        type: string
+        default: "nutriproducr"
+      aks-cluster:
+        type: string
+        default: "nutri-prod-aks"
+      aks-resource-group:
+        type: string
+        default: "nutri-prod-global-rg"
+      health-check-url:
+        description: HTTPS URL to poll after deploy (leave empty to skip)
+        type: string
+        default: ""
+    secrets:
+      AZURE_CLIENT_ID:
+        required: false
+      AZURE_CLIENT_SECRET:
+        required: false
+      AZURE_TENANT_ID:
+        required: false
+      AZURE_SUBSCRIPTION_ID:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-prod-aks:
+    name: Build, push and helm deploy (prod)
+    runs-on: ubuntu-latest
+    environment: production
+    # One prod deploy per service at a time; never cancel one that is mid-rollout.
+    concurrency:
+      group: prod-deploy-${{ inputs.image-name }}
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: sha
+        run: echo "tag=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: >-
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+            }
+
+      - name: Login to ACR
+        run: az acr login --name ${{ inputs.acr-name }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Pushes the commit-SHA tag only. Prod never deploys or pushes "latest".
+      - name: Build and push to ACR
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          push: true
+          tags: ${{ inputs.acr-name }}.azurecr.io/${{ inputs.image-name }}:${{ steps.sha.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: ${{ inputs.build-args }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ inputs.aks-resource-group }} \
+            --name ${{ inputs.aks-cluster }} \
+            --overwrite-existing
+
+      # --atomic waits for the rollout and rolls back automatically if it fails.
+      - name: Helm upgrade / install
+        run: |
+          RELEASE="${{ inputs.helm-release-name }}"
+          if [ -z "$RELEASE" ]; then
+            RELEASE="${{ inputs.image-name }}"
+          fi
+          VALUES_FILE="./${{ inputs.helm-chart-path }}/values-prod.yaml"
+          if [ ! -f "$VALUES_FILE" ]; then
+            echo "::error::$VALUES_FILE not found; refusing to deploy prod without prod values"
+            exit 1
+          fi
+          helm upgrade --install "$RELEASE" ./${{ inputs.helm-chart-path }} \
+            -f "$VALUES_FILE" \
+            --namespace ${{ inputs.namespace }} \
+            --create-namespace \
+            --set image.repository=${{ inputs.acr-name }}.azurecr.io/${{ inputs.image-name }} \
+            --set image.tag=${{ steps.sha.outputs.tag }} \
+            --atomic --timeout 10m
+
+      - name: Health check
+        if: inputs.health-check-url != ''
+        run: |
+          URL="${{ inputs.health-check-url }}"
+          echo "Polling $URL for up to 5 minutes..."
+          for i in $(seq 1 20); do
+            CODE=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 5 "$URL" 2>/dev/null || echo "000")
+            if [ "$CODE" = "200" ]; then
+              echo "Health check passed (attempt $i, HTTP 200)"
+              exit 0
+            fi
+            echo "Attempt $i/20 - HTTP $CODE, retrying in 15s..."
+            sleep 15
+          done
+          echo "::error::Health check timed out after 5 minutes"
+          exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "### Prod AKS deploy" >> $GITHUB_STEP_SUMMARY
+          echo "- Image: \`${{ inputs.acr-name }}.azurecr.io/${{ inputs.image-name }}:${{ steps.sha.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Cluster: \`${{ inputs.aks-cluster }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Namespace: \`${{ inputs.namespace }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Commit: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Triggered by: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
