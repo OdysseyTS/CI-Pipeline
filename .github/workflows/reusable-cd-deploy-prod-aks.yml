@@ -2,7 +2,7 @@
 #
 # Separate from reusable-cd-deploy.yml on purpose, so the QA path cannot be affected.
 # The single job runs in the GitHub environment "nutri-prod". Configure that environment
-# in each caller repo with required reviewers (the approval gate) and with these
+# in each caller repo (deployment branch restricted to main) and with these
 # environment secrets, which then apply only to prod deploys:
 #   AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID
 # Callers must pass `secrets: inherit`.
@@ -50,6 +50,13 @@ on:
         description: HTTPS URL to poll after deploy (leave empty to skip)
         type: string
         default: ""
+      require-qa-deployed:
+        description: >-
+          Refuse to deploy unless QA already deployed this exact code (the caller's QA job
+          records tag qa-deployed/<git tree hash> on success). Keep true; only set false
+          for a deliberate emergency hotfix.
+        type: boolean
+        default: true
     secrets:
       AZURE_CLIENT_ID:
         required: false
@@ -75,6 +82,21 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      # QA -> prod gate. Compares the git TREE (the file contents), not the commit SHA, so it
+      # still passes when staging is merged into main with a merge commit (new SHA, same
+      # code). If anything differs from what QA deployed, this fails before any build or login.
+      - name: Verify QA deployed this exact code
+        if: ${{ inputs.require-qa-deployed }}
+        run: |
+          TREE=$(git rev-parse "HEAD^{tree}")
+          echo "Tree for this commit: $TREE"
+          if git ls-remote --exit-code --tags origin "refs/tags/qa-deployed/${TREE}" >/dev/null 2>&1; then
+            echo "QA deployed this exact code (tag qa-deployed/${TREE})."
+          else
+            echo "::error::QA has not deployed this code. Push it to staging, wait for the QA deploy to pass, then promote the same code to main and re-run. (Tag qa-deployed/${TREE} not found.)"
+            exit 1
+          fi
 
       - name: Set image tag
         id: sha
